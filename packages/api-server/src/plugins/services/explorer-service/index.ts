@@ -1,34 +1,31 @@
-import fp from "fastify-plugin";
+import {MySQLPromisePool} from "@fastify/mysql";
+import async from "async";
 import {Job, Queue} from "bullmq";
+import {randomUUID} from "crypto";
+import {FastifyBaseLogger} from "fastify";
+import fp from "fastify-plugin";
+import {DateTime} from "luxon";
+import {Connection, PoolConnection, ResultSetHeader} from "mysql2/promise";
+import crypto from "node:crypto";
+import {pino} from "pino";
+import {TiDBPlaygroundQueryExecutor} from "../../../core/executor/query-executor/TiDBPlaygroundQueryExecutor";
 import {withConnection, withTransaction} from "../../../utils/db";
 import {
-    APIError, BotResponseGenerateError,
+    APIError,
+    BotResponseGenerateError,
     BotResponseParseError,
+    ExplorerCancelRecommendQuestionError,
     ExplorerCreateQuestionError,
-    ExplorerPrepareQuestionError, ExplorerRecommendQuestionError,
-    ExplorerResolveQuestionError, ExplorerSetQuestionTagsError,
-    ExplorerTooManyRequestError, ExplorerCancelRecommendQuestionError,
+    ExplorerPrepareQuestionError,
+    ExplorerRecommendQuestionError,
+    ExplorerResolveQuestionError,
+    ExplorerSetQuestionTagsError,
+    ExplorerTooManyRequestError,
     SQLUnsupportedFunctionError,
     ValidateSQLError
 } from "../../../utils/error";
-import {Connection, ResultSetHeader} from "mysql2/promise";
-import crypto from "node:crypto";
-import {DateTime} from "luxon";
+import sleep from "../../../utils/sleep";
 import {BotService} from "../bot-service";
-import {
-    PlanStep,
-    Question,
-    QuestionFeedback,
-    QuestionFeedbackType,
-    QuestionQueryResult,
-    QuestionQueryResultWithChart,
-    QuestionQueueNames,
-    QuestionSQLResult,
-    QuestionStatus,
-    ValidateSQLResult
-} from "./types";
-import {TiDBPlaygroundQueryExecutor} from "../../../core/executor/query-executor/TiDBPlaygroundQueryExecutor";
-import {randomUUID} from "crypto";
 import {
     BarChart,
     ChartNames,
@@ -43,11 +40,18 @@ import {
     RepoCard,
     Table
 } from "../bot-service/types";
-import {FastifyBaseLogger} from "fastify";
-import {MySQLPromisePool} from "@fastify/mysql";
-import async from "async";
-import sleep from "../../../utils/sleep";
-import {pino} from "pino";
+import {
+    PlanStep,
+    Question,
+    QuestionFeedback,
+    QuestionFeedbackType,
+    QuestionQueryResult,
+    QuestionQueryResultWithChart,
+    QuestionQueueNames,
+    QuestionSQLResult,
+    QuestionStatus,
+    ValidateSQLResult
+} from "./types";
 import BaseLogger = pino.BaseLogger;
 
 declare module 'fastify' {
@@ -121,13 +125,16 @@ export class ExplorerService {
 
     async newQuestion(
       userId: number, q: string, ignoreCache: boolean = false, ignoreRateLimit: boolean = false,
-      needReview: boolean = false, batchJobId: string | null = null
+      needReview: boolean = false, batchJobId: string | null = null, maxOnGoingQuestions: number = 1
     ): Promise<Question> {
         const questionId = randomUUID();
         const logger = this.logger.child({ questionId: questionId });
         const normalizedQuestion = this.normalizeQuestion(q);
         if (normalizedQuestion.length > 512) {
-            throw new APIError(400, 'The question is too long, please shorten it.');
+            const message = `The question is too long, please shorten it.`;
+            throw new ExplorerPrepareQuestionError(message, QuestionFeedbackType.ErrorQuestionIsTooLong, {
+                message: message
+            });
         }
 
         // Prepare the new question.
@@ -182,7 +189,8 @@ export class ExplorerService {
 
             const onGongStatuses = [QuestionStatus.AnswerGenerating, QuestionStatus.SQLValidating, QuestionStatus.Waiting, QuestionStatus.Running];
             const onGongQuestions = previousQuestions.filter(q => onGongStatuses.includes(q.status));
-            if (onGongQuestions.length >= this.options.userMaxQuestionsOnGoing) {
+            const maxOnGoing = maxOnGoingQuestions ?? this.options.userMaxQuestionsOnGoing;
+            if (onGongQuestions.length >= maxOnGoing) {
               logger.info("There are %d previous question on going, cancel them.", onGongQuestions.length);
               await this.cancelQuestions(conn, onGongQuestions.map(q => q.id));
             }
@@ -206,7 +214,7 @@ export class ExplorerService {
         return question;
     }
 
-    async prepareQuestion(question: Question) {
+    async prepareQuestion(question: Question, outputAnswerInStream?: boolean): Promise<Question> {
         const { id: questionId } = question;
         const logger = this.logger.child({ questionId: questionId });
 
@@ -216,7 +224,7 @@ export class ExplorerService {
             await this.updateQuestion(question);
 
             // Generate the SQL by OpenAI.
-            let outputInStream = this.options.outputAnswerInStream;
+            let outputInStream = outputAnswerInStream ?? this.options.outputAnswerInStream;
             await this.generateAnswer(logger, question, outputInStream);
             if (!question.sqlCanAnswer || typeof question.querySQL !== 'string' || question.querySQL.length === 0) {
                 const message = 'Failed to generate SQL, the question may exceed the scope of what can be answered.';
@@ -277,6 +285,8 @@ export class ExplorerService {
 
             // Push the question to the queue.
             await this.pushJobToQueue(logger, question);
+
+            return question;
         } catch (err: any) {
             if (err instanceof ExplorerPrepareQuestionError) {
                 await this.updateQuestion({
@@ -800,11 +810,33 @@ export class ExplorerService {
             this.logger.info('⏳ Start query executing for question <%s>, start: %s', questionId, executedAt.toISO());
 
             const markedSQL = `/* questionId: ${questionId} */ ${querySQL}`;
-            const [rows, fields] = await this.playgroundQueryExecutor.execute(`explorer-sql-${questionId}`, {
-                sql: markedSQL,
-                timeout: this.options.querySQLTimeout,
-            }) as [any[], any[]];
+            const res = await withConnection(this.playgroundQueryExecutor.pool, async (conn: PoolConnection) => {
+                // Get Connection ID (cast int64 to char).
+                const result = await conn.query('SELECT CAST(CONNECTION_ID() AS CHAR) AS connectionId;');
+                const connections = result[0] as { connectionId: string }[];
+                const connectionId = connections[0].connectionId;
 
+                try {
+                    return await this.playgroundQueryExecutor.executeWithConn(conn, `explorer-sql-${questionId}`, {
+                        sql: markedSQL,
+                        timeout: this.options.querySQLTimeout
+                    }) as [any[], any[]];
+                } catch (err: any) {
+                    // If the query times out, the connection is terminated by the KILL command,
+                    // preventing the heavy query from continuing.
+                    if (err.code === 'PROTOCOL_SEQUENCE_TIMEOUT') {
+                        try {
+                            await this.tidb.query(`KILL ${connectionId};`);
+                            conn.destroy();
+                            this.logger.info(`Killed the connection: ${connectionId}`);
+                        } catch (err2) {
+                            this.logger.error(err2, `Failed to kill the connection: ${connectionId}`);
+                        }
+                    }
+                    throw err;
+                }
+            });
+            const [rows, fields] = res!;
             const finishedAt = DateTime.now();
             const spent = finishedAt.diff(executedAt).as("seconds");
             this.logger.info(
@@ -823,7 +855,7 @@ export class ExplorerService {
             }
         } catch (err: any) {
             if (err.code === 'PROTOCOL_SEQUENCE_TIMEOUT') {
-                throw new ExplorerResolveQuestionError(err.sqlMessage, QuestionFeedbackType.ErrorQueryTimeout,{
+                throw new ExplorerResolveQuestionError(err.sqlMessage || err.message, QuestionFeedbackType.ErrorQueryTimeout,{
                     querySQL,
                     message: err.message
                 });
